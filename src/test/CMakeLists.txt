@@ -37,6 +37,7 @@ target_link_libraries(
   PRIVATE -lnvinfer
   PRIVATE -lnvcaffe_parser
   PRIVATE ${CUDA_LIBRARIES}
+  PRIVATE -lcuda
 )
 install(
   TARGETS caffe2plan
