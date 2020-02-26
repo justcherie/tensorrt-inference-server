@@ -26,6 +26,7 @@
 
 #include "src/core/scheduler_utils.h"
 
+#include "src/core/constants.h"
 #include "src/core/provider.h"
 
 namespace nvidia { namespace inferenceserver {
@@ -95,6 +96,226 @@ CompareWithPendingShape(
   }
 
   return true;
+}
+
+Status
+RequestQueue::Enqueue(Scheduler::Payload&& payload)
+{
+  if ((max_queue_size_ != 0) && (queue_.size() >= max_queue_size_)) {
+    return Status(RequestStatusCode::UNAVAILABLE, "Exceeds maximum queue size");
+  }
+  queue_.emplace_back(std::move(payload));
+  auto timeout_microseconds = default_timeout_microseconds_;
+  if (allow_timeout_override_ &&
+      queue_.back().request_provider_->RequestHeader().timeout_microseconds() !=
+          0) {
+    timeout_microseconds =
+        queue_.back().request_provider_->RequestHeader().timeout_microseconds();
+  }
+  if (timeout_microseconds != 0) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    timeout_timestamp_ns_.emplace_back(
+        TIMESPEC_TO_NANOS(now) + timeout_microseconds * 1000);
+  } else {
+    timeout_timestamp_ns_.emplace_back(0);
+  }
+
+  return Status::Success;
+}
+
+Scheduler::Payload
+RequestQueue::Dequeue()
+{
+  if (!queue_.empty()) {
+    auto res = std::move(queue_.front());
+    queue_.pop_front();
+    timeout_timestamp_ns_.pop_front();
+    return res;
+  } else {
+    auto res = std::move(delayed_queue_.front());
+    delayed_queue_.pop_front();
+    return res;
+  }
+}
+
+bool
+RequestQueue::ApplyPolicy(size_t idx)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  auto now_nanoseconds = TIMESPEC_TO_NANOS(now);
+  while (idx < queue_.size()) {
+    if ((timeout_timestamp_ns_[idx] != 0) &&
+        (now_nanoseconds > timeout_timestamp_ns_[idx])) {
+      if (timeout_action_ == ModelQueuePolicy::DELAY) {
+        delayed_queue_.emplace_back(std::move(queue_[idx]));
+      } else {
+        rejected_queue_.emplace_back(std::move(queue_[idx]));
+      }
+      // FIXME: erase on deque is linear, should consider to use different data
+      // structure instead. List is the first one to think of, but the traversal
+      // may not be as efficient due to cache miss.
+      queue_.erase(queue_.begin() + idx);
+      timeout_timestamp_ns_.erase(timeout_timestamp_ns_.begin() + idx);
+    } else {
+      // Current idx is pointing to an item with unexpired timeout
+      return true;
+    }
+  }
+  // At this point, idx is pointing to an item with expired timeout.
+  // If the item is in delayed queue, then return true. Otherwise, false
+  // meaning the queue has no item with this 'idx'.
+  return ((idx - queue_.size()) < delayed_queue_.size());
+}
+
+std::deque<Scheduler::Payload>
+RequestQueue::ReleaseRejectedQueue()
+{
+  std::deque<Scheduler::Payload> res;
+  rejected_queue_.swap(res);
+  return res;
+}
+
+Scheduler::Payload&
+RequestQueue::At(size_t idx)
+{
+  if (idx < queue_.size()) {
+    return queue_[idx];
+  } else {
+    return delayed_queue_[idx - queue_.size()];
+  }
+}
+
+uint64_t
+RequestQueue::TimeoutAt(size_t idx)
+{
+  if (idx < queue_.size()) {
+    return timeout_timestamp_ns_[idx];
+  } else {
+    return 0;
+  }
+}
+
+PriorityQueue::PriorityQueue()
+{
+  ModelQueuePolicy default_policy;
+  queues_.emplace(0, RequestQueue(default_policy));
+  ResetCursor();
+}
+
+PriorityQueue::PriorityQueue(
+    const ModelQueuePolicy& default_queue_policy, uint32_t priority_levels,
+    const ModelQueuePolicyMap queue_policy_map)
+{
+  if (priority_levels == 0) {
+    queues_.emplace(0, RequestQueue(default_queue_policy));
+  } else {
+    for (uint32_t level = 1; level <= priority_levels; level++) {
+      auto it = queue_policy_map.find(level);
+      if (it == queue_policy_map.end()) {
+        queues_.emplace(level, RequestQueue(default_queue_policy));
+      } else {
+        queues_.emplace(level, RequestQueue(it->second));
+      }
+    }
+  }
+  ResetCursor();
+}
+
+Status
+PriorityQueue::Enqueue(uint32_t priority_level, Scheduler::Payload&& payload)
+{
+  auto status = queues_[priority_level].Enqueue(std::move(payload));
+  if (status.IsOk() && pending_cursor_.valid_) {
+    pending_cursor_.valid_ &=
+        (priority_level > pending_cursor_.curr_it_->first);
+  }
+  return status;
+}
+
+Scheduler::Payload
+PriorityQueue::Dequeue()
+{
+  pending_cursor_.valid_ = false;
+  for (auto& queue : queues_) {
+    if (!queue.second.Empty()) {
+      return queue.second.Dequeue();
+    }
+  }
+  throw std::out_of_range("dequeue on empty queue");
+}
+
+size_t
+PriorityQueue::Size()
+{
+  size_t res = 0;
+  for (auto& queue : queues_) {
+    res += queue.second.Size();
+  }
+  return res;
+}
+
+bool
+PriorityQueue::IsCursorValid()
+{
+  if (pending_cursor_.valid_) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return TIMESPEC_TO_NANOS(now) <
+           pending_cursor_.pending_batch_closest_timeout_ns_;
+  }
+  return false;
+}
+
+PriorityQueue::Cursor::Cursor(
+    PriorityQueues::iterator start_it, PriorityQueues::iterator end_it)
+    : curr_it_(start_it), end_it_(end_it), queue_idx_(0),
+      pending_batch_closest_timeout_ns_(0),
+      pending_batch_oldest_enqueue_time_ns_(0), valid_(false)
+{
+  while (curr_it_ != end_it_) {
+    if (!(curr_it_->second.ApplyPolicy(queue_idx_))) {
+      curr_it_++;
+      queue_idx_ = 0;
+    } else {
+      pending_batch_closest_timeout_ns_ =
+          curr_it_->second.TimeoutAt(queue_idx_);
+      pending_batch_oldest_enqueue_time_ns_ = TIMESPEC_TO_NANOS(
+          curr_it_->second.At(queue_idx_)
+              .stats_->Timestamp(ModelInferStats::TimestampKind::kQueueStart));
+      valid_ = true;
+      break;
+    }
+  }
+}
+
+void
+PriorityQueue::Cursor::Next()
+{
+  const auto& timeout_ns = curr_it_->second.TimeoutAt(queue_idx_);
+  if (timeout_ns != 0) {
+    if (pending_batch_closest_timeout_ns_ != 0) {
+      pending_batch_closest_timeout_ns_ =
+          std::min(pending_batch_closest_timeout_ns_, timeout_ns);
+    } else {
+      pending_batch_closest_timeout_ns_ = timeout_ns;
+    }
+  }
+  pending_batch_oldest_enqueue_time_ns_ = std::min(
+      pending_batch_oldest_enqueue_time_ns_,
+      TIMESPEC_TO_NANOS(
+          curr_it_->second.At(queue_idx_)
+              .stats_->Timestamp(ModelInferStats::TimestampKind::kQueueStart)));
+  ++queue_idx_;
+  while (curr_it_ != end_it_) {
+    if (!(curr_it_->second.ApplyPolicy(queue_idx_))) {
+      curr_it_++;
+      queue_idx_ = 0;
+    } else {
+      break;
+    }
+  }
 }
 
 }}  // namespace nvidia::inferenceserver

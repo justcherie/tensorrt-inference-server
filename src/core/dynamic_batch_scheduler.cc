@@ -143,8 +143,8 @@ DynamicBatchScheduler::Create(
       preferred_batch_sizes, max_queue_delay_microseconds);
   std::unique_ptr<DynamicBatchScheduler> sched(dyna_sched);
 
-  sched->queue_ = PriorityQueue(
-      default_queue_policy, priority_levels, queue_policy_map);
+  sched->queue_ =
+      PriorityQueue(default_queue_policy, priority_levels, queue_policy_map);
 
   // Create one scheduler thread for each requested runner. Associate
   // each scheduler thread with a runner.
@@ -227,9 +227,10 @@ DynamicBatchScheduler::Enqueue(
   bool wake_runner = false;
   {
     std::lock_guard<std::mutex> lock(mu_);
-    enqueue_status = queue_.Emplace(
-        request_header.priority(), stats, request_provider, response_provider,
-        OnComplete);
+    enqueue_status = queue_.Enqueue(
+        request_header.priority(),
+        std::move(
+            Payload(stats, request_provider, response_provider, OnComplete)));
     if (enqueue_status.IsOk()) {
       queued_batch_size_ += request_header.batch_size();
 
@@ -497,7 +498,7 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
 
     search_batch_size += batch_size;
     search_batch_cnt++;
-    queue_.Next();
+    queue_.AdvanceCursor();
 
     if (preferred_batch_sizes_.find(search_batch_size) !=
         preferred_batch_sizes_.end()) {
@@ -555,16 +556,13 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   }
 
   // Return non-zero wait microseconds to cause this thread to wait
-  // until the queue delay has expired, or when there is expired timeout.
-  // Another thread may be awaken
+  // until the queue delay has expired. Another thread may be awaken
   // due to incoming request to handle the pending batch before this
   // thread wakes and that is ok. But if no other request comes in
   // then this thread will wake and revisit the pending batch (and at
   // that time will then see the delay has been exceeded and will send
   // the batch).
-  return std::min(
-             (pending_batch_delay_ns_ - delay_ns), queue_.ClosestTimeout()) /
-         1000;
+  return (pending_batch_delay_ns_ - delay_ns) / 1000;
 }
 
 void
