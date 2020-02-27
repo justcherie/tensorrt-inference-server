@@ -233,18 +233,18 @@ DynamicBatchScheduler::Enqueue(
             Payload(stats, request_provider, response_provider, OnComplete)));
     if (enqueue_status.IsOk()) {
       queued_batch_size_ += request_header.batch_size();
+    }
 
-      // If there are any idle runners and the queued batch size is greater or
-      // equal to next preferred batch size, then wake one up to service this
-      // request. We do the actual wake outside of the lock to avoid having the
-      // woken thread immediately block on the lock
-      wake_runner = (idle_scheduler_thread_cnt_ > 0);
+    // If there are any idle runners and the queued batch size is greater or
+    // equal to next preferred batch size, then wake one up to service this
+    // request. We do the actual wake outside of the lock to avoid having the
+    // woken thread immediately block on the lock
+    wake_runner = (idle_scheduler_thread_cnt_ > 0);
 
-      // We may wake up runner less often if we don't enforce equal shape within
-      // a batch, otherwise must always wake up runner to check it
-      if (enforce_equal_shape_tensors_.empty()) {
-        wake_runner &= (queued_batch_size_ >= next_preferred_batch_size_);
-      }
+    // We may wake up runner less often if we don't enforce equal shape within
+    // a batch, otherwise must always wake up runner to check it
+    if (enforce_equal_shape_tensors_.empty()) {
+      wake_runner &= (queued_batch_size_ >= next_preferred_batch_size_);
     }
   }
 
@@ -459,6 +459,7 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
   size_t best_preferred_batch_cnt = 0;
   size_t search_batch_size = pending_batch_size_;
   size_t search_batch_cnt = pending_batch_queue_cnt_;
+  queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
   while (!queue_.CursorEnd()) {
     const auto batch_size = queue_.PayloadAtCursor()
                                 .request_provider_->RequestHeader()
@@ -499,6 +500,7 @@ DynamicBatchScheduler::GetDynamicBatch(const int64_t runner_id)
     search_batch_size += batch_size;
     search_batch_cnt++;
     queue_.AdvanceCursor();
+    queued_batch_size_ -= queue_.ApplyPolicyAtCursor();
 
     if (preferred_batch_sizes_.find(search_batch_size) !=
         preferred_batch_sizes_.end()) {

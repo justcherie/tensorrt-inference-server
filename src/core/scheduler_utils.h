@@ -50,59 +50,6 @@ bool CompareWithPendingShape(
 using ModelQueuePolicyMap =
     ::google::protobuf::Map<::google::protobuf::uint32, ModelQueuePolicy>;
 
-class RequestQueue {
- public:
-  RequestQueue()
-      : timeout_action_(ModelQueuePolicy::REJECT),
-        default_timeout_microseconds_(0), allow_timeout_override_(false),
-        max_queue_size_(0)
-  {
-  }
-
-  RequestQueue(const ModelQueuePolicy& policy)
-      : timeout_action_(policy.timeout_action()),
-        default_timeout_microseconds_(policy.default_timeout_microseconds()),
-        allow_timeout_override_(policy.allow_timeout_override()),
-        max_queue_size_(policy.max_queue_size())
-  {
-  }
-
-  // Enqueue an payload and set up its timeout accordingly.
-  Status Enqueue(Scheduler::Payload&& payload);
-
-  // Dequeue the payload at the front of the queue.
-  Scheduler::Payload Dequeue();
-
-  // Apply the queue policy to payload at 'idx'.
-  // Return true if the 'idx' still points to an payload after applying the
-  // policy, false otherwise.
-  bool ApplyPolicy(size_t idx);
-
-  // Return the rejected payloads held by the request queue.
-  std::deque<Scheduler::Payload> ReleaseRejectedQueue();
-
-  // Return the payload at 'idx'.
-  Scheduler::Payload& At(size_t idx);
-
-  // Return the timeout timestamp of the payload at 'idx', in ns. A value of 0
-  // indicates that the payload doesn't specify a timeout.
-  uint64_t TimeoutAt(size_t idx);
-
-  bool Empty() { return Size() == 0; }
-
-  size_t Size() { return queue_.size() + delayed_queue_.size(); }
-
- private:
-  std::deque<Scheduler::Payload> queue_;
-  std::deque<uint64_t> timeout_timestamp_ns_;
-  std::deque<Scheduler::Payload> delayed_queue_;
-  std::deque<Scheduler::Payload> rejected_queue_;
-  const ModelQueuePolicy::TimeoutAction timeout_action_;
-  const uint64_t default_timeout_microseconds_;
-  const bool allow_timeout_override_;
-  const uint32_t max_queue_size_;
-};
-
 class PriorityQueue {
  public:
   PriorityQueue();
@@ -115,25 +62,42 @@ class PriorityQueue {
 
   Scheduler::Payload Dequeue();
 
-  size_t Size();
+  std::vector<std::deque<Scheduler::Payload>> ReleaseRejectedPayloads();
+
+  size_t Size() { return size_; }
 
   bool Empty() { return Size() == 0; }
 
-  Scheduler::Payload& PayloadAtCursor() { return pending_cursor_.GetItem(); }
-
-  void MarkCursor() { current_mark_ = pending_cursor_; }
-
-  void AdvanceCursor() { pending_cursor_.Next(); }
-
-  bool CursorEnd()
-  {
-    return pending_cursor_.curr_it_ == pending_cursor_.end_it_;
-  }
-
+  // Reset the cursor such that it is pointing to the first request
+  // in the queue. The resulting cursor will be invalid if the
+  // queue is empty.
   void ResetCursor()
   {
-    pending_cursor_ = Cursor(queues_.begin(), queues_.end());
+    pending_cursor_ = Cursor(queues_.begin(), --queues_.end(), &size_);
   }
+
+  // Record the current cursor. The cursor can be restored to recorded state
+  // by invoking SetCursorToMark(). Note that Enqueue(), Dequeue(), and
+  // ResetCursor() will invalidate the marker, it is the function caller's
+  // responsibility to ensure the marker is valid before calling
+  // SetCursorToMark().
+  void MarkCursor() { current_mark_ = pending_cursor_; }
+
+  // Apply the queue policy and alter the underlying queue accordingly. After
+  // the function returns, the cursor may be at its end to indicate that
+  // there no request after the pending batch.
+  // Returns the total batch size of the newly rejected requests.
+  size_t ApplyPolicyAtCursor();
+
+  // Return the payload at cursor.
+  Scheduler::Payload& PayloadAtCursor() { return pending_cursor_.GetItem(); }
+
+  // Advance the cursor for pending batch. This function will not trigger the
+  // queue policy. No effect if the cursor already reach the end of the queue.
+  void AdvanceCursor() { pending_cursor_.Next(); }
+
+  bool CursorEnd() { return pending_cursor_.pending_batch_count_ == size_; }
+
 
   void SetCursorToMark() { pending_cursor_ = current_mark_; }
 
@@ -145,16 +109,78 @@ class PriorityQueue {
   }
 
  private:
-  using PriorityQueues = std::map<uint32_t, RequestQueue>;
-  PriorityQueues queues_;
+  class PolicyQueue {
+   public:
+    PolicyQueue()
+        : timeout_action_(ModelQueuePolicy::REJECT), default_timeout_ms_(0),
+          allow_timeout_override_(false), max_queue_size_(0)
+    {
+    }
+
+    PolicyQueue(const ModelQueuePolicy& policy)
+        : timeout_action_(policy.timeout_action()),
+          default_timeout_ms_(policy.default_timeout_microseconds()),
+          allow_timeout_override_(policy.allow_timeout_override()),
+          max_queue_size_(policy.max_queue_size())
+    {
+    }
+
+    // Enqueue an payload and set up its timeout accordingly.
+    Status Enqueue(Scheduler::Payload&& payload);
+
+    // Dequeue the payload at the front of the queue.
+    Scheduler::Payload Dequeue();
+
+    // Apply the queue policy to payload at 'idx'.
+    // 'rejected_count' will be incremented by the number of the newly rejected
+    // requets after applying the policy.
+    // 'rejected_batch_size' will be incremented by the total batch size of the
+    // newly rejected requets after applying the policy.
+    // Return true if the 'idx' still points to an payload after applying the
+    // policy, false otherwise.
+    bool ApplyPolicy(
+        size_t idx, size_t* rejected_count, size_t* rejected_batch_size);
+
+    // Return the rejected payloads held by the request queue.
+    std::deque<Scheduler::Payload> ReleaseRejectedQueue();
+
+    // Return the payload at 'idx'.
+    Scheduler::Payload& At(size_t idx);
+
+    // Return the timeout timestamp of the payload at 'idx', in ns. A value of 0
+    // indicates that the payload doesn't specify a timeout.
+    uint64_t TimeoutAt(size_t idx);
+
+    // Return whether the queue is empty, rejected requests are not included.
+    bool Empty() { return Size() == 0; }
+
+    // Return the number of requests in the queue, rejected requests are not
+    // included.
+    size_t Size() { return queue_.size() + delayed_queue_.size(); }
+
+   private:
+    // Variables that define the policy for the queue
+    const ModelQueuePolicy::TimeoutAction timeout_action_;
+    const uint64_t default_timeout_ms_;
+    const bool allow_timeout_override_;
+    const uint32_t max_queue_size_;
+
+    std::deque<uint64_t> timeout_timestamp_ns_;
+    std::deque<Scheduler::Payload> queue_;
+    std::deque<Scheduler::Payload> delayed_queue_;
+    std::deque<Scheduler::Payload> rejected_queue_;
+  };
+  using PriorityQueues = std::map<uint32_t, PolicyQueue>;
 
   // Cursor which points to the item after the pending batch
   struct Cursor {
     Cursor() = default;
-    Cursor(PriorityQueues::iterator start_it, PriorityQueues::iterator end_it);
+    Cursor(PriorityQueues::iterator start_it, PriorityQueues::iterator last_it,
+    size_t* queue_size);
 
     Cursor(const Cursor& rhs)
-        : curr_it_(rhs.curr_it_), end_it_(rhs.end_it_),
+        : queue_size_(rhs.queue_size_),
+        curr_it_(rhs.curr_it_), last_it_(rhs.last_it_),
           queue_idx_(rhs.queue_idx_),
           pending_batch_closest_timeout_ns_(
               rhs.pending_batch_closest_timeout_ns_),
@@ -168,13 +194,21 @@ class PriorityQueue {
 
     void Next();
 
+    // Reference to the priority queue size, so that the cursor itself knows
+    // whether it is at the end of the queue (pending batch covers the whole
+    // queue)
+    size_t* queue_size_;
     PriorityQueues::iterator curr_it_;
-    PriorityQueues::iterator end_it_;
+    PriorityQueues::iterator last_it_;
     size_t queue_idx_;
     uint64_t pending_batch_closest_timeout_ns_;
     uint64_t pending_batch_oldest_enqueue_time_ns_;
+    size_t pending_batch_count_;
     bool valid_;
   };
+
+  PriorityQueues queues_;
+  size_t size_;
 
   Cursor pending_cursor_;
   Cursor current_mark_;

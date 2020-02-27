@@ -99,24 +99,25 @@ CompareWithPendingShape(
 }
 
 Status
-RequestQueue::Enqueue(Scheduler::Payload&& payload)
+PriorityQueue::PolicyQueue::Enqueue(Scheduler::Payload&& payload)
 {
   if ((max_queue_size_ != 0) && (queue_.size() >= max_queue_size_)) {
     return Status(RequestStatusCode::UNAVAILABLE, "Exceeds maximum queue size");
   }
   queue_.emplace_back(std::move(payload));
-  auto timeout_microseconds = default_timeout_microseconds_;
-  if (allow_timeout_override_ &&
-      queue_.back().request_provider_->RequestHeader().timeout_microseconds() !=
-          0) {
-    timeout_microseconds =
+  auto timeout_ms = default_timeout_ms_;
+  if (allow_timeout_override_) {
+    auto override_timeout_ms =
         queue_.back().request_provider_->RequestHeader().timeout_microseconds();
+    if (override_timeout_ms != 0 && override_timeout_ms < timeout_ms) {
+      timeout_ms = override_timeout_ms;
+    }
   }
-  if (timeout_microseconds != 0) {
+  if (timeout_ms != 0) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     timeout_timestamp_ns_.emplace_back(
-        TIMESPEC_TO_NANOS(now) + timeout_microseconds * 1000);
+        TIMESPEC_TO_NANOS(now) + timeout_ms * 1000);
   } else {
     timeout_timestamp_ns_.emplace_back(0);
   }
@@ -125,7 +126,7 @@ RequestQueue::Enqueue(Scheduler::Payload&& payload)
 }
 
 Scheduler::Payload
-RequestQueue::Dequeue()
+PriorityQueue::PolicyQueue::Dequeue()
 {
   if (!queue_.empty()) {
     auto res = std::move(queue_.front());
@@ -140,7 +141,8 @@ RequestQueue::Dequeue()
 }
 
 bool
-RequestQueue::ApplyPolicy(size_t idx)
+PriorityQueue::PolicyQueue::ApplyPolicy(
+    size_t idx, size_t* rejected_count, size_t* rejected_batch_size)
 {
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -152,6 +154,9 @@ RequestQueue::ApplyPolicy(size_t idx)
         delayed_queue_.emplace_back(std::move(queue_[idx]));
       } else {
         rejected_queue_.emplace_back(std::move(queue_[idx]));
+        *rejected_count++;
+        *rejected_batch_size +=
+            rejected_queue_.back().request_provider_.BatchSize();
       }
       // FIXME: erase on deque is linear, should consider to use different data
       // structure instead. List is the first one to think of, but the traversal
@@ -170,7 +175,7 @@ RequestQueue::ApplyPolicy(size_t idx)
 }
 
 std::deque<Scheduler::Payload>
-RequestQueue::ReleaseRejectedQueue()
+PriorityQueue::PolicyQueue::ReleaseRejectedQueue()
 {
   std::deque<Scheduler::Payload> res;
   rejected_queue_.swap(res);
@@ -178,7 +183,7 @@ RequestQueue::ReleaseRejectedQueue()
 }
 
 Scheduler::Payload&
-RequestQueue::At(size_t idx)
+PriorityQueue::PolicyQueue::At(size_t idx)
 {
   if (idx < queue_.size()) {
     return queue_[idx];
@@ -188,7 +193,7 @@ RequestQueue::At(size_t idx)
 }
 
 uint64_t
-RequestQueue::TimeoutAt(size_t idx)
+PriorityQueue::PolicyQueue::TimeoutAt(size_t idx)
 {
   if (idx < queue_.size()) {
     return timeout_timestamp_ns_[idx];
@@ -200,7 +205,7 @@ RequestQueue::TimeoutAt(size_t idx)
 PriorityQueue::PriorityQueue()
 {
   ModelQueuePolicy default_policy;
-  queues_.emplace(0, RequestQueue(default_policy));
+  queues_.emplace(0, PolicyQueue(default_policy));
   ResetCursor();
 }
 
@@ -209,14 +214,14 @@ PriorityQueue::PriorityQueue(
     const ModelQueuePolicyMap queue_policy_map)
 {
   if (priority_levels == 0) {
-    queues_.emplace(0, RequestQueue(default_queue_policy));
+    queues_.emplace(0, PolicyQueue(default_queue_policy));
   } else {
     for (uint32_t level = 1; level <= priority_levels; level++) {
       auto it = queue_policy_map.find(level);
       if (it == queue_policy_map.end()) {
-        queues_.emplace(level, RequestQueue(default_queue_policy));
+        queues_.emplace(level, PolicyQueue(default_queue_policy));
       } else {
-        queues_.emplace(level, RequestQueue(it->second));
+        queues_.emplace(level, PolicyQueue(it->second));
       }
     }
   }
@@ -227,9 +232,12 @@ Status
 PriorityQueue::Enqueue(uint32_t priority_level, Scheduler::Payload&& payload)
 {
   auto status = queues_[priority_level].Enqueue(std::move(payload));
-  if (status.IsOk() && pending_cursor_.valid_) {
-    pending_cursor_.valid_ &=
-        (priority_level > pending_cursor_.curr_it_->first);
+  if (status.IsOk()) {
+    size_++;
+    if (pending_cursor_.valid_) {
+      pending_cursor_.valid_ &=
+          (priority_level > pending_cursor_.curr_it_->first);
+    }
   }
   return status;
 }
@@ -240,20 +248,11 @@ PriorityQueue::Dequeue()
   pending_cursor_.valid_ = false;
   for (auto& queue : queues_) {
     if (!queue.second.Empty()) {
+      size_--;
       return queue.second.Dequeue();
     }
   }
   throw std::out_of_range("dequeue on empty queue");
-}
-
-size_t
-PriorityQueue::Size()
-{
-  size_t res = 0;
-  for (auto& queue : queues_) {
-    res += queue.second.Size();
-  }
-  return res;
 }
 
 bool
@@ -269,25 +268,32 @@ PriorityQueue::IsCursorValid()
 }
 
 PriorityQueue::Cursor::Cursor(
-    PriorityQueues::iterator start_it, PriorityQueues::iterator end_it)
-    : curr_it_(start_it), end_it_(end_it), queue_idx_(0),
+    PriorityQueues::iterator start_it, PriorityQueues::iterator last_it,
+    size_t* queue_size)
+    : queue_size_(queue_size), curr_it_(start_it), last_it_(last_it),
+      queue_idx_(0),
       pending_batch_closest_timeout_ns_(0),
-      pending_batch_oldest_enqueue_time_ns_(0), valid_(false)
+      pending_batch_oldest_enqueue_time_ns_(0), valid_(true)
 {
-  while (curr_it_ != end_it_) {
-    if (!(curr_it_->second.ApplyPolicy(queue_idx_))) {
+}
+
+size_t
+PriorityQueue::ApplyPolicyAtCursor()
+{
+  size_t rejected_batch_size = 0;
+  size_t rejected_count = 0;
+  while (pending_cursor_.curr_it_ != pending_cursor_.end_it_) {
+    if (!(pending_cursor_.curr_it_->second.ApplyPolicy(
+            pending_cursor_.queue_idx_, &rejected_count,
+            &rejected_batch_size))) {
       curr_it_++;
       queue_idx_ = 0;
     } else {
-      pending_batch_closest_timeout_ns_ =
-          curr_it_->second.TimeoutAt(queue_idx_);
-      pending_batch_oldest_enqueue_time_ns_ = TIMESPEC_TO_NANOS(
-          curr_it_->second.At(queue_idx_)
-              .stats_->Timestamp(ModelInferStats::TimestampKind::kQueueStart));
-      valid_ = true;
       break;
     }
   }
+  size_ -= rejected_count;
+  return rejected_batch_size;
 }
 
 void
