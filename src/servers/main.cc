@@ -501,7 +501,7 @@ StartHttpService(
 
 #ifdef TRTIS_ENABLE_HTTP_V2
 TRTSERVER_Error*
-StartHttpService(
+StartHttpV2Service(
     std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServerV2>>*
         services,
     const std::shared_ptr<TRTSERVER_Server>& server,
@@ -620,7 +620,7 @@ StartEndpoints(
       }
     }
 
-    TRTSERVER_Error* err = StartHttpService(
+    TRTSERVER_Error* err = StartHttpV2Service(
         &http_services_v2_, server, trace_manager, smb_manager, port_map);
     if (err != nullptr) {
       LOG_TRTSERVER_ERROR(err, "failed to start HTTP service");
@@ -1189,12 +1189,12 @@ Parse(TRTSERVER_ServerOptions* server_options, int argc, char** argv)
   http_port_ = http_port;
   http_health_port_ = http_health_port;
   http_thread_cnt_ = http_thread_cnt;
-#ifdef TRTIS_ENABLE_HTTP_V2
-  http_ports_ = {http_health_port_, http_port_};
-#else
-  http_ports_ = {http_port_, http_health_port_, http_port_,
-                 http_port_, http_port_,        http_port_};
-#endif  // TRTIS_ENABLE_HTTP_V2
+  if (api_version_ == 2) {
+    http_ports_ = {http_health_port_, http_port_};
+  } else {
+    http_ports_ = {http_port_, http_health_port_, http_port_,
+                   http_port_, http_port_,        http_port_};
+  }
 #endif  // TRTIS_ENABLE_HTTP || TRTIS_ENABLE_HTTP_V2
 
 #if defined(TRTIS_ENABLE_GRPC) || defined(TRTIS_ENABLE_GRPC_V2)
