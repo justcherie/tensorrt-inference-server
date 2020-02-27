@@ -28,6 +28,7 @@
 
 #include "src/core/constants.h"
 #include "src/core/provider.h"
+#include <cassert>
 
 namespace nvidia { namespace inferenceserver {
 
@@ -101,7 +102,7 @@ CompareWithPendingShape(
 Status
 PriorityQueue::PolicyQueue::Enqueue(Scheduler::Payload&& payload)
 {
-  if ((max_queue_size_ != 0) && (queue_.size() >= max_queue_size_)) {
+  if ((max_queue_size_ != 0) && (Size() >= max_queue_size_)) {
     return Status(RequestStatusCode::UNAVAILABLE, "Exceeds maximum queue size");
   }
   queue_.emplace_back(std::move(payload));
@@ -234,8 +235,10 @@ PriorityQueue::Enqueue(uint32_t priority_level, Scheduler::Payload&& payload)
   auto status = queues_[priority_level].Enqueue(std::move(payload));
   if (status.IsOk()) {
     size_++;
-    if (pending_cursor_.valid_) {
-      pending_cursor_.valid_ &=
+    pending_cursor_.valid_ = pending_cursor_.valid_ &&
+    // FIXME: change to ">=", we just need to make sure pending batch hasn't
+    // reached delayed queue, then new payload at the same level is guaranteed
+    // to be after pending batch.
           (priority_level > pending_cursor_.curr_it_->first);
     }
   }
@@ -246,6 +249,7 @@ Scheduler::Payload
 PriorityQueue::Dequeue()
 {
   pending_cursor_.valid_ = false;
+  // FIXME: be smart here, keep track of policy queue that is current head
   for (auto& queue : queues_) {
     if (!queue.second.Empty()) {
       size_--;
@@ -268,12 +272,11 @@ PriorityQueue::IsCursorValid()
 }
 
 PriorityQueue::Cursor::Cursor(
-    PriorityQueues::iterator start_it, PriorityQueues::iterator last_it,
-    size_t* queue_size)
-    : queue_size_(queue_size), curr_it_(start_it), last_it_(last_it),
-      queue_idx_(0),
+    PriorityQueues::iterator start_it)
+    : curr_it_(start_it), queue_idx_(0),
       pending_batch_closest_timeout_ns_(0),
-      pending_batch_oldest_enqueue_time_ns_(0), valid_(true)
+      pending_batch_oldest_enqueue_time_ns_(0),
+      pending_batch_count_(0), valid_(true)
 {
 }
 
@@ -282,46 +285,51 @@ PriorityQueue::ApplyPolicyAtCursor()
 {
   size_t rejected_batch_size = 0;
   size_t rejected_count = 0;
-  while (pending_cursor_.curr_it_ != pending_cursor_.end_it_) {
+  while (pending_cursor_.curr_it_ != queues_.end()) {
     if (!(pending_cursor_.curr_it_->second.ApplyPolicy(
             pending_cursor_.queue_idx_, &rejected_count,
             &rejected_batch_size))) {
-      curr_it_++;
-      queue_idx_ = 0;
-    } else {
-      break;
+      if (size_ > pending_cursor_.pending_batch_count_ + rejected_count) {
+        curr_it_++;
+        queue_idx_ = 0;
+        continue;
+      }
     }
+    // Control reach here if the cursor points to a payload that is candidate for
+    // pending batch, or if all payloads are in pending batch.
+    break;
   }
+  // DEBUG: remove the check below. We don't want cursor to go beyond 'queues_'
+  // so that we can simply call ApplyPolicyAtCursor() again when new payloads are
+  // added, and we can make sure that curr_it_ can be dereferenced safely.
+  assert(pending_cursor_.curr_it_ != queues_.end());
   size_ -= rejected_count;
   return rejected_batch_size;
 }
 
-void
-PriorityQueue::Cursor::Next()
+void PriorityQueue::AdvanceCursor()
 {
-  const auto& timeout_ns = curr_it_->second.TimeoutAt(queue_idx_);
+  if (pending_cursor_.pending_batch_count_ >= size_) {
+    return;
+  }
+
+  const auto& timeout_ns = pending_cursor_.curr_it_->second.TimeoutAt(pending_cursor_.queue_idx_);
   if (timeout_ns != 0) {
-    if (pending_batch_closest_timeout_ns_ != 0) {
-      pending_batch_closest_timeout_ns_ =
-          std::min(pending_batch_closest_timeout_ns_, timeout_ns);
+    if (pending_cursor_.pending_batch_closest_timeout_ns_ != 0) {
+      pending_cursor_.pending_batch_closest_timeout_ns_ =
+          std::min(pending_cursor_.pending_batch_closest_timeout_ns_, timeout_ns);
     } else {
-      pending_batch_closest_timeout_ns_ = timeout_ns;
+      pending_cursor_.pending_batch_closest_timeout_ns_ = timeout_ns;
     }
   }
-  pending_batch_oldest_enqueue_time_ns_ = std::min(
-      pending_batch_oldest_enqueue_time_ns_,
+
+  pending_cursor_.pending_batch_oldest_enqueue_time_ns_ = std::min(
+      pending_cursor_.pending_batch_oldest_enqueue_time_ns_,
       TIMESPEC_TO_NANOS(
-          curr_it_->second.At(queue_idx_)
+          pending_cursor_.curr_it_->second.At(pending_cursor_.queue_idx_)
               .stats_->Timestamp(ModelInferStats::TimestampKind::kQueueStart)));
-  ++queue_idx_;
-  while (curr_it_ != end_it_) {
-    if (!(curr_it_->second.ApplyPolicy(queue_idx_))) {
-      curr_it_++;
-      queue_idx_ = 0;
-    } else {
-      break;
-    }
-  }
+  ++pending_cursor_.queue_idx_;
+  ++pending_cursor_.pending_batch_count_;
 }
 
 }}  // namespace nvidia::inferenceserver
