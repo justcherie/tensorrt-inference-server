@@ -1236,7 +1236,7 @@ InferResponseRelease(
 TRTSERVER_Error*
 InferAllocatorPayload(
     const std::shared_ptr<TRTSERVER_Server>& trtserver,
-    const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+    const std::shared_ptr<SharedMemoryManager>& shm_manager,
     const ModelInferRequest& request, ModelInferResponse& response,
     AllocPayload* alloc_payload)
 {
@@ -1253,16 +1253,11 @@ InferAllocatorPayload(
   for (const auto& io : request.outputs()) {
     if (io.has_shared_memory()) {
       void* base;
-      TRTSERVER_SharedMemoryBlock* smb = nullptr;
-      RETURN_IF_ERR(smb_manager->Get(&smb, io.shared_memory().name()));
-      RETURN_IF_ERR(TRTSERVER_ServerSharedMemoryAddress(
-          trtserver.get(), smb, io.shared_memory().offset(),
-          io.shared_memory().byte_size(), &base));
-
       TRTSERVER_Memory_Type memory_type;
       int64_t memory_type_id;
-      TRTSERVER_SharedMemoryBlockMemoryType(smb, &memory_type);
-      TRTSERVER_SharedMemoryBlockMemoryTypeId(smb, &memory_type_id);
+      RETURN_IF_ERR(shm_manager->GetMemoryInfo(
+          io.shared_memory().name(), io.shared_memory().offset(), &base,
+          &memory_type, &memory_type_id));
 
       // if shm_map_ does not exist, then create an empty shm_map
       if (alloc_payload->shm_map_ == nullptr) {
@@ -1282,7 +1277,7 @@ InferAllocatorPayload(
 TRTSERVER_Error*
 InferGRPCToInput(
     const std::shared_ptr<TRTSERVER_Server>& trtserver,
-    const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+    const std::shared_ptr<SharedMemoryManager>& shm_manager,
     const ModelInferRequest& request,
     TRTSERVER_InferenceRequestProvider* request_provider)
 {
@@ -1295,14 +1290,12 @@ InferGRPCToInput(
     int64_t memory_type_id = 0;
 #if 0
     if (io.has_shared_memory()) {
-      TRTSERVER_SharedMemoryBlock* smb = nullptr;
-      RETURN_IF_ERR(smb_manager->Get(&smb, io.shared_memory().name()));
-      RETURN_IF_ERR(TRTSERVER_ServerSharedMemoryAddress(
-          trtserver.get(), smb, io.shared_memory().offset(),
-          io.shared_memory().byte_size(), const_cast<void**>(&base)));
+      void* tmp;
+      RETURN_IF_ERR(shm_manager->GetMemoryInfo(
+          io.shared_memory().name(), io.shared_memory().offset(), &tmp,
+          &memory_type, &memory_type_id));
+      base = tmp;
       byte_size = io.shared_memory().byte_size();
-      TRTSERVER_SharedMemoryBlockMemoryType(smb, &memory_type);
-      TRTSERVER_SharedMemoryBlockMemoryTypeId(smb, &memory_type_id);
     } else
 #endif
     {
@@ -1356,12 +1349,12 @@ class ModelInferHandler
       const std::string& name,
       const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
       const std::shared_ptr<TraceManager>& trace_manager,
-      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+      const std::shared_ptr<SharedMemoryManager>& shm_manager,
       GRPCInferenceService::AsyncService* service,
       grpc::ServerCompletionQueue* cq, size_t max_state_bucket_count)
       : Handler(
             name, trtserver, server_id, service, cq, max_state_bucket_count),
-        trace_manager_(trace_manager), smb_manager_(smb_manager)
+        trace_manager_(trace_manager), shm_manager_(shm_manager)
   {
     // Create the allocator that will be used to allocate buffers for
     // the result tensors.
@@ -1381,7 +1374,7 @@ class ModelInferHandler
       TRTSERVER_InferenceResponse* response, void* userp);
 
   std::shared_ptr<TraceManager> trace_manager_;
-  std::shared_ptr<SharedMemoryBlockManager> smb_manager_;
+  std::shared_ptr<SharedMemoryManager> shm_manager_;
   TRTSERVER_ResponseAllocator* allocator_;
 };
 
@@ -1466,11 +1459,11 @@ ModelInferHandler::Process(Handler::State* state, bool rpc_ok)
 
     if (err == nullptr) {
       err =
-          InferGRPCToInput(trtserver_, smb_manager_, request, request_provider);
+          InferGRPCToInput(trtserver_, shm_manager_, request, request_provider);
     }
     if (err == nullptr) {
       err = InferAllocatorPayload(
-          trtserver_, smb_manager_, request, response, &state->alloc_payload_);
+          trtserver_, shm_manager_, request, response, &state->alloc_payload_);
     }
     if (err == nullptr) {
       // Provide the trace manager object to use for this request, if
@@ -1663,12 +1656,12 @@ class StreamInferHandler
       const std::string& name,
       const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
       const std::shared_ptr<TraceManager>& trace_manager,
-      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+      const std::shared_ptr<SharedMemoryManager>& shm_manager,
       GRPCInferenceService::AsyncService* service,
       grpc::ServerCompletionQueue* cq, size_t max_state_bucket_count)
       : Handler(
             name, trtserver, server_id, service, cq, max_state_bucket_count),
-        trace_manager_(trace_manager), smb_manager_(smb_manager)
+        trace_manager_(trace_manager), shm_manager_(shm_manager)
   {
     // Create the allocator that will be used to allocate buffers for
     // the result tensors.
@@ -1688,7 +1681,7 @@ class StreamInferHandler
       TRTSERVER_InferenceResponse* response, void* userp);
 
   std::shared_ptr<TraceManager> trace_manager_;
-  std::shared_ptr<SharedMemoryBlockManager> smb_manager_;
+  std::shared_ptr<SharedMemoryManager> shm_manager_;
   TRTSERVER_ResponseAllocator* allocator_;
 };
 
@@ -1808,12 +1801,12 @@ StreamInferHandler::Process(Handler::State* state, bool rpc_ok)
     }
     if (err == nullptr) {
       err = InferGRPCToInput(
-          trtserver_, smb_manager_, request.meta_data(), request,
+          trtserver_, shm_manager_, request.meta_data(), request,
           request_provider);
     }
     if (err == nullptr) {
       err = InferAllocatorPayload(
-          trtserver_, smb_manager_, request.meta_data(), response,
+          trtserver_, shm_manager_, request.meta_data(), response,
           &state->alloc_payload_);
     }
     if (err == nullptr) {
@@ -2214,12 +2207,12 @@ class SharedMemoryControlHandler
   SharedMemoryControlHandler(
       const std::string& name,
       const std::shared_ptr<TRTSERVER_Server>& trtserver, const char* server_id,
-      const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+      const std::shared_ptr<SharedMemoryManager>& shm_manager,
       GRPCInferenceService::AsyncService* service,
       grpc::ServerCompletionQueue* cq, size_t max_state_bucket_count)
       : Handler(
             name, trtserver, server_id, service, cq, max_state_bucket_count),
-        smb_manager_(smb_manager)
+        shm_manager_(shm_manager)
   {
   }
 
@@ -2228,7 +2221,7 @@ class SharedMemoryControlHandler
   bool Process(State* state, bool rpc_ok) override;
 
  private:
-  std::shared_ptr<SharedMemoryBlockManager> smb_manager_;
+  std::shared_ptr<SharedMemoryManager> shm_manager_;
 };
 
 void
@@ -2263,20 +2256,15 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
   SharedMemoryControlResponse& response = state->response_;
 
   if (state->step_ == START) {
-    TRTSERVER_SharedMemoryBlock* smb = nullptr;
-
-    TRTSERVER_Error* err = nullptr;
+        TRTSERVER_Error* err = nullptr;
     if (request.has_register_()) {
       if (request.register_().has_system_shared_memory()) {
         // system shared memory
-        err = smb_manager_->CpuCreate(
-            &smb, request.register_().name(),
+        RETURN_IF_ERR(shm_manager_->AddSystemSharedMemory(
+            request.register_().name(),
             request.register_().system_shared_memory().shared_memory_key(),
             request.register_().system_shared_memory().offset(),
-            request.register_().byte_size());
-        if (err == nullptr) {
-          err = TRTSERVER_ServerRegisterSharedMemory(trtserver_.get(), smb);
-        }
+            request.register_().byte_size()));
       } else if (request.register_().has_cuda_shared_memory()) {
         // cuda shared memory
 #ifdef TRTIS_ENABLE_GPU
@@ -2285,13 +2273,10 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
         char* handle_base = const_cast<char*>(raw_handle.c_str());
         cudaIpcMemHandle_t* cuda_shm_handle =
             reinterpret_cast<cudaIpcMemHandle_t*>(handle_base);
-        err = smb_manager_->GpuCreate(
-            &smb, request.register_().name(), cuda_shm_handle,
+        RETURN_IF_ERR(shm_manager_->AddCUDASharedMemory(
+            request.register_().name(), cuda_shm_handle,
             request.register_().byte_size(),
-            request.register_().cuda_shared_memory().device_id());
-        if (err == nullptr) {
-          err = TRTSERVER_ServerRegisterSharedMemory(trtserver_.get(), smb);
-        }
+            request.register_().cuda_shared_memory().device_id()));
 #else
         err = TRTSERVER_ErrorNew(
             TRTSERVER_ERROR_INVALID_ARG,
@@ -2309,41 +2294,12 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
                 .c_str());
       }
     } else if (request.has_unregister()) {
-      err = smb_manager_->Remove(&smb, request.unregister().name());
-      if ((err == nullptr) && (smb != nullptr)) {
-        err = TRTSERVER_ServerUnregisterSharedMemory(trtserver_.get(), smb);
-        TRTSERVER_Error* del_err = TRTSERVER_SharedMemoryBlockDelete(smb);
-        if (del_err != nullptr) {
-          LOG_ERROR << "failed to delete shared memory block: "
-                    << TRTSERVER_ErrorMessage(del_err);
-          TRTSERVER_ErrorDelete(del_err);
-        }
-      }
+      RETURN_IF_ERR(shm_manager_->Remove(request.unregister().name()));
     } else if (request.has_unregister_all()) {
-      err = smb_manager_->Clear();
-      if (err == nullptr) {
-        err = TRTSERVER_ServerUnregisterAllSharedMemory(trtserver_.get());
-      }
+      RETURN_IF_ERR(shm_manager_->Clear());
     } else if (request.has_status()) {
-      TRTSERVER_Protobuf* shm_status_protobuf = nullptr;
-      err = TRTSERVER_ServerSharedMemoryStatus(
-          trtserver_.get(), &shm_status_protobuf);
-      if (err == nullptr) {
-        const char* status_buffer;
-        size_t status_byte_size;
-        err = TRTSERVER_ProtobufSerialize(
-            shm_status_protobuf, &status_buffer, &status_byte_size);
-        auto shm_status_response = response.mutable_shared_memory_status();
-        if (err == nullptr) {
-          if (!shm_status_response->ParseFromArray(
-                  status_buffer, status_byte_size)) {
-            err = TRTSERVER_ErrorNew(
-                TRTSERVER_ERROR_INTERNAL,
-                "failed to parse shared memory status");
-          }
-        }
-      }
-      TRTSERVER_ProtobufDelete(shm_status_protobuf);
+      auto shm_status_response = response.mutable_shared_memory_status();
+      RETURN_IF_ERR(shm_manager_->GetStatus(shm_status_response));
     } else {
       err = TRTSERVER_ErrorNew(
           TRTSERVER_ERROR_UNKNOWN, "unknown sharedmemorycontrol request type");
@@ -2379,10 +2335,10 @@ SharedMemoryControlHandler::Process(Handler::State* state, bool rpc_ok)
 GRPCServerV2::GRPCServerV2(
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<SharedMemoryBlockManager>& smb_manager,
+    const std::shared_ptr<SharedMemoryManager>& shm_manager,
     const char* server_id, const std::string& server_addr,
     const int infer_allocation_pool_size)
-    : server_(server), trace_manager_(trace_manager), smb_manager_(smb_manager),
+    : server_(server), trace_manager_(trace_manager), shm_manager_(shm_manager),
       server_id_(server_id), server_addr_(server_addr),
       infer_allocation_pool_size_(infer_allocation_pool_size), running_(false)
 {
@@ -2397,7 +2353,7 @@ TRTSERVER_Error*
 GRPCServerV2::Create(
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<SharedMemoryBlockManager>& smb_manager, int32_t port,
+    const std::shared_ptr<SharedMemoryManager>& shm_manager, int32_t port,
     int infer_allocation_pool_size, std::unique_ptr<GRPCServerV2>* grpc_server)
 {
   const char* server_id = nullptr;
@@ -2409,7 +2365,7 @@ GRPCServerV2::Create(
 
   const std::string addr = "0.0.0.0:" + std::to_string(port);
   grpc_server->reset(new GRPCServerV2(
-      server, trace_manager, smb_manager, server_id, addr,
+      server, trace_manager, shm_manager, server_id, addr,
       infer_allocation_pool_size));
 
   return nullptr;  // success
@@ -2486,7 +2442,7 @@ GRPCServerV2::Start()
 
   // Handler for model inference requests.
   ModelInferHandler* hmodelinfer = new ModelInferHandler(
-      "ModelInferHandler", server_, server_id_, trace_manager_, smb_manager_,
+      "ModelInferHandler", server_, server_id_, trace_manager_, shm_manager_,
       &service_, model_infer_cq_.get(),
       infer_allocation_pool_size_ /* max_state_bucket_count */);
   hmodelinfer->Start();
@@ -2495,7 +2451,7 @@ GRPCServerV2::Start()
 #if 0
   // Handler for streaming inference requests.
   StreamInferHandler* hstreaminfer = new StreamInferHandler(
-      "StreamInferHandler", server_, server_id_, trace_manager_, smb_manager_,
+      "StreamInferHandler", server_, server_id_, trace_manager_, shm_manager_,
       &service_, stream_infer_cq_.get(),
       infer_allocation_pool_size_ /* max_state_bucket_count */);
   hstreaminfer->Start();
@@ -2517,7 +2473,7 @@ GRPCServerV2::Start()
 
   // Handler for shared-memory-control requests.
   SharedMemoryControlHandler* hshmcontrol = new SharedMemoryControlHandler(
-      "SharedMemoryControlHandler", server_, server_id_, smb_manager_,
+      "SharedMemoryControlHandler", server_, server_id_, shm_manager_,
       &service_, shmcontrol_cq_.get(), 2 /* max_state_bucket_count */);
   hshmcontrol->Start();
   shmcontrol_handler_.reset(hshmcontrol);

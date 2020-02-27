@@ -41,7 +41,7 @@
 #include "src/core/logging.h"
 #include "src/core/trtserver.h"
 #include "src/servers/common.h"
-#include "src/servers/shared_memory_block_manager.h"
+#include "src/servers/shared_memory_manager.h"
 #include "src/servers/tracer.h"
 
 #ifdef TRTIS_ENABLE_GPU
@@ -417,11 +417,11 @@ StartGrpcService(
     std::unique_ptr<nvidia::inferenceserver::GRPCServer>* service,
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
-        smb_manager)
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryManager>&
+        shm_manager)
 {
   TRTSERVER_Error* err = nvidia::inferenceserver::GRPCServer::Create(
-      server, trace_manager, smb_manager, grpc_port_, grpc_infer_thread_cnt_,
+      server, trace_manager, shm_manager, grpc_port_, grpc_infer_thread_cnt_,
       grpc_stream_infer_thread_cnt_, grpc_infer_allocation_pool_size_, service);
   if (err == nullptr) {
     err = (*service)->Start();
@@ -441,11 +441,11 @@ StartGrpcServiceV2(
     std::unique_ptr<nvidia::inferenceserver::GRPCServerV2>* service,
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
-        smb_manager)
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryManager>&
+        shm_manager)
 {
   TRTSERVER_Error* err = nvidia::inferenceserver::GRPCServerV2::Create(
-      server, trace_manager, smb_manager, grpc_port_,
+      server, trace_manager, shm_manager, grpc_port_,
       grpc_infer_allocation_pool_size_, service);
   if (err == nullptr) {
     err = (*service)->Start();
@@ -465,12 +465,12 @@ StartHttpService(
     std::vector<std::unique_ptr<nvidia::inferenceserver::HTTPServer>>* services,
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
-        smb_manager,
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryManager>&
+        shm_manager,
     std::map<int32_t, std::vector<std::string>>& port_map)
 {
   TRTSERVER_Error* err = nvidia::inferenceserver::HTTPServer::CreateAPIServer(
-      server, trace_manager, smb_manager, port_map, http_thread_cnt_, services);
+      server, trace_manager, shm_manager, port_map, http_thread_cnt_, services);
   if (err == nullptr) {
     for (auto& http_eps : *services) {
       if (http_eps != nullptr) {
@@ -515,8 +515,8 @@ bool
 StartEndpoints(
     const std::shared_ptr<TRTSERVER_Server>& server,
     const std::shared_ptr<nvidia::inferenceserver::TraceManager>& trace_manager,
-    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryBlockManager>&
-        smb_manager)
+    const std::shared_ptr<nvidia::inferenceserver::SharedMemoryManager>&
+        shm_manager)
 {
   const char* id;
   FAIL_IF_ERR(TRTSERVER_ServerId(server.get(), &id), "getting server ID");
@@ -526,7 +526,7 @@ StartEndpoints(
   // Enable GRPC endpoints if requested...
   if (allow_grpc_ && (api_version_ == 1) && (grpc_port_ != -1)) {
     TRTSERVER_Error* err =
-        StartGrpcService(&grpc_service_, server, trace_manager, smb_manager);
+        StartGrpcService(&grpc_service_, server, trace_manager, shm_manager);
     if (err != nullptr) {
       LOG_TRTSERVER_ERROR(err, "failed to start GRPC service");
       return false;
@@ -538,7 +538,7 @@ StartEndpoints(
   // Enable GRPC V2 endpoints if requested...
   if (allow_grpc_ && (api_version_ == 2) && (grpc_port_ != -1)) {
     TRTSERVER_Error* err = StartGrpcServiceV2(
-        &grpc_service_v2_, server, trace_manager, smb_manager);
+        &grpc_service_v2_, server, trace_manager, shm_manager);
     if (err != nullptr) {
       LOG_TRTSERVER_ERROR(err, "failed to start GRPC V2 service");
       return false;
@@ -559,7 +559,7 @@ StartEndpoints(
     }
 
     TRTSERVER_Error* err = StartHttpService(
-        &http_services_, server, trace_manager, smb_manager, port_map);
+        &http_services_, server, trace_manager, shm_manager, port_map);
     if (err != nullptr) {
       LOG_TRTSERVER_ERROR(err, "failed to start HTTP service");
       return false;
@@ -1239,8 +1239,8 @@ main(int argc, char** argv)
   std::shared_ptr<nvidia::inferenceserver::TraceManager> trace_manager;
 
   // Manager for shared memory blocks.
-  auto smb_manager =
-      std::make_shared<nvidia::inferenceserver::SharedMemoryBlockManager>();
+  auto shm_manager =
+      std::make_shared<nvidia::inferenceserver::SharedMemoryManager>();
 
   // Create the server...
   TRTSERVER_Server* server_ptr = nullptr;
@@ -1257,7 +1257,7 @@ main(int argc, char** argv)
   }
 
   // Start the HTTP, GRPC, and metrics endpoints.
-  if (!StartEndpoints(server, trace_manager, smb_manager)) {
+  if (!StartEndpoints(server, trace_manager, shm_manager)) {
     exit(1);
   }
 
